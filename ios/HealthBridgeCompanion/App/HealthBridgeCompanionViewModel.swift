@@ -3670,6 +3670,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         }
     }
 
+    private static let unknownStepReadAckCursorKind = "automatic_steps_unknown_raw_ack"
+
     private func processAutomaticStepRepresentations(
         pendingGenerationRetirements: [String: Int]
     ) async -> AutomaticSyncTypeResult {
@@ -3699,8 +3701,26 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
             }
             try requireCurrentConnectionGeneration(expectedGeneration)
 
-            // Raw acceptance checkpoints its own cursor, but cannot retire the daily obligation.
-            let raw = await performRecentStepCounts(executionMode: .automatic)
+            // An ACKed unknown read completes only this generation's raw observation,
+            // never a HealthKit baseline, upload proof, or the separate daily obligation.
+            let (cursorStore, progressScope) = try captureReceiverSyncProgressScope()
+            let unknownReadACK = try cursorStore.cursorValue(
+                receiverBindingID: progressScope.receiverBindingID,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: Self.unknownStepReadAckCursorKind
+            )
+            let expectedUnknownReadACK = pendingGenerationRetirements["steps"].map {
+                "\(expectedGeneration):\($0)"
+            }
+            let raw: QuantitySyncOutcome
+            if let expectedUnknownReadACK, unknownReadACK == expectedUnknownReadACK {
+                raw = .noPayload
+            } else {
+                raw = await performRecentStepCounts(
+                    executionMode: .automatic,
+                    pendingGenerationRetirements: pendingGenerationRetirements
+                )
+            }
             try requireCurrentConnectionGeneration(expectedGeneration)
             switch raw {
             case .noPayload, .accepted:
@@ -4426,7 +4446,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     uploadedRecords: uploadedRecords,
                     hasUploadedRecords: hasUploadedStepRecords
                 )
-            let cursorCheckpoint = shouldPersistAnchorCursor
+            var cursorCheckpoint = shouldPersistAnchorCursor
                 ? FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: sourceKey,
@@ -4439,6 +4459,14 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                     FileOutboxCursorCheckpoint(receiverIdentity: receiverBindingID, sourceKey: sourceKey,
                         cursorKind: $0.cursorKind, cursorValue: $0.cursorValue)
                 }
+            if executionMode == .automatic, !rawProgressKnown,
+               let pendingGeneration = pendingGenerationRetirements["steps"] {
+                cursorCheckpoint = FileOutboxCursorCheckpoint(
+                    receiverIdentity: receiverBindingID, sourceKey: sourceKey,
+                    cursorKind: Self.unknownStepReadAckCursorKind,
+                    cursorValue: "\(progressScope.connectionGeneration):\(pendingGeneration)"
+                )
+            }
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             let deliveryResult = try await uploadPayloadsWithOutbox(
@@ -4612,12 +4640,18 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                         && $0.cursorKind == DailyActivityAggregateSyncPolicy.cursorKind
                 })
                 : nil
+            // Consume the handoff only at daily ACK, before retiring dirtiness.
+            // Observer counters can restart at one after a completed generation.
+            let unknownReadACKReset = stepsRawAndDailyCoverage == true
+                ? HealthBridgeSyncCursor(sourceKey: sourceKey,
+                    cursorKind: Self.unknownStepReadAckCursorKind, cursorValue: "") : nil
             let cursorCheckpoint = cursor.map {
                 FileOutboxCursorCheckpoint(
                     receiverIdentity: receiverBindingID,
                     sourceKey: $0.sourceKey,
                     cursorKind: $0.cursorKind,
                     cursorValue: $0.cursorValue,
+                    additionalCursors: unknownReadACKReset.map { [$0] },
                     cumulativeRawAndDailyCoverage: cumulativeRawAndDailyCoverage
                 )
             } ?? (cumulativeRawAndDailyCoverage != nil ? batch.sync.cursors.first(where: {
@@ -4626,7 +4660,10 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 FileOutboxCursorCheckpoint(receiverIdentity: receiverBindingID, sourceKey: $0.sourceKey,
                     cursorKind: $0.cursorKind, cursorValue: $0.cursorValue,
                     cumulativeRawAndDailyCoverage: cumulativeRawAndDailyCoverage)
-            } : nil)
+            } : nil) ?? unknownReadACKReset.map {
+                FileOutboxCursorCheckpoint(receiverIdentity: receiverBindingID, sourceKey: $0.sourceKey,
+                    cursorKind: $0.cursorKind, cursorValue: $0.cursorValue)
+            }
             failureStage = .transport
             try requireCurrentReceiverSyncProgressScope(progressScope)
             let deliveryResult = try await uploadPayloadsWithOutbox(

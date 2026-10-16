@@ -533,6 +533,40 @@ class DailyProjectionIngest:
                     )
 
     def _note_unresolved(self, source: int, identifier: str) -> None:
+        types = TypeAdapter(list[tuple[str]]).validate_python(
+            self.connection.execute(
+                (
+                    "select distinct type_code from samples where source_id=? "
+                    "and json_extract(metadata_json, '$.sample_kind')='daily_aggregate'"
+                ),
+                (source,),
+            ).fetchall()
+        )
+        for (stored_type,) in types:
+            candidate_type = canonical_sample_type_code(stored_type)
+            if (
+                (source, candidate_type) in self.by_source_type
+                or (source, candidate_type) in self.rejected
+                or not _deletion_matches_type(identifier, candidate_type)
+            ):
+                continue
+            # Without an observation order, invalidate existing confidence only;
+            # never infer a deletion day, raw interval, or causal sequence.
+            _ = self.connection.execute(
+                (
+                    "update samples set metadata_json=json_set(metadata_json,?,?,?,?) "
+                    "where source_id=? and type_code=? "
+                    "and json_extract(metadata_json, '$.sample_kind')='daily_aggregate'"
+                ),
+                (
+                    f"$.{STATE_KEY}.status",
+                    "unknown",
+                    f"$.{STATE_KEY}.reason",
+                    "raw_scope_unknown",
+                    source,
+                    stored_type,
+                ),
+            )
         for (
             candidate_source,
             candidate_type,

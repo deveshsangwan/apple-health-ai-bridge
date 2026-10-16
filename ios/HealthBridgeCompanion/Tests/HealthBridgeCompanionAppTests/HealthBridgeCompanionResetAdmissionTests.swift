@@ -145,6 +145,101 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try fixture.assertPublishedStepsAwaitingACK(admitted: admitted)
     }
 
+    func testNativeMailboxUnseededEmptyRawACKReachesAuthoritativeDailyZero() async throws {
+        let fixture = try NativeMailboxAutomaticFixture(unseededEmptyRaw: true)
+        defer { fixture.cleanUp() }
+        var dailyReadCount = 0
+        let readDaily: @MainActor ([String], Date, Date, Calendar) async throws -> [HealthKitDailyActivityAggregate] = { types, _, end, calendar in
+            dailyReadCount += 1
+            XCTAssertEqual(types, ["steps"])
+            let today = calendar.startOfDay(for: end)
+            let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: today))
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = calendar.timeZone
+            formatter.dateFormat = "yyyy-MM-dd"
+            return [HealthKitDailyActivityAggregate(typeCode: "steps", dayStart: yesterday, dayEnd: today,
+                value: 0, calendarDay: formatter.string(from: yesterday), timeZoneIdentifier: calendar.timeZone.identifier)]
+        }
+        var runtime = try makeNativeMailboxRuntime(fixture, readDailyActivityAggregates: readDaily)
+        defer { runtime.automaticSyncRuntime.stopAdmission() }
+        await runtime.bootstrap()
+        let binding = try XCTUnwrap(fixture.makeSettingsStore().receiverBindingID)
+        let proof = CoreLaneUploadProofStore(userDefaults: fixture.defaults)
+        XCTAssertNil(try fixture.stepCursor())
+        XCTAssertFalse(proof.hasUploadedRecords(lane: .steps, receiverBindingID: binding))
+        for cycle in 1...2 {
+            let runID = UUID()
+            guard case .continueProcessing = runtime.viewModel.admitAutomaticSyncObserver(typeCode: "steps", diagnosticRunID: runID) else {
+                return XCTFail("An unseeded native mailbox must admit Steps work.")
+            }
+            let admitted = try fixture.pending()
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "steps"), diagnosticRunID: runID)
+            let raw = try XCTUnwrap(try fixture.outbox.pendingItems().first)
+            let rawBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: raw.fileURL))
+            XCTAssertTrue(rawBatch.samples.isEmpty)
+            XCTAssertTrue(rawBatch.deletedRecords.isEmpty)
+            XCTAssertFalse(rawBatch.sync.cursors.contains { $0.cursorKind == StepCountSyncBatchFactory.anchoredCursorKind })
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+            XCTAssertEqual(dailyReadCount, cycle - 1, "Publishing an unknown raw read is not acceptance.")
+            XCTAssertEqual(fixture.rawReadCount, cycle)
+            let rawACK = try fixture.signedAcknowledgment(for: raw)
+            try rawACK.bytes.write(to: rawACK.url, options: .atomic)
+            await wakeMailboxAndWait(runtime, callback: try XCTUnwrap(fixture.mailboxObserver.onChange))
+            XCTAssertEqual(try fixture.outbox.deliveryState(for: raw.id)?.phase, .committedFinalized)
+            XCTAssertEqual(try fixture.pending(), admitted)
+            XCTAssertNil(try fixture.stepCursor())
+            XCTAssertFalse(proof.hasUploadedRecords(lane: .steps, receiverBindingID: binding))
+            XCTAssertEqual(fixture.rawReadCount, cycle, "ACK wakes remain delivery-only.")
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            runtime = try makeNativeMailboxRuntime(fixture, readDailyActivityAggregates: readDaily)
+            await runtime.bootstrap()
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+            XCTAssertEqual(dailyReadCount, cycle, "A later ordinary collection must reach authoritative daily statistics, not queue another unknown raw read.")
+            let daily = try XCTUnwrap(try fixture.outbox.pendingItems().first)
+            XCTAssertNotEqual(daily.id, raw.id)
+            let dailyBatch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: Data(contentsOf: daily.fileURL))
+            XCTAssertEqual(dailyBatch.samples.map(\.value), [0])
+            XCTAssertTrue(dailyBatch.sync.cursors.contains { $0.cursorKind == DailyProjectionObservation.cursorPrefix + "steps" })
+            XCTAssertEqual(try fixture.pending(), admitted, "Only the separate daily ACK may retire the observer generation.")
+            let dailyACK = try fixture.signedAcknowledgment(for: daily)
+            try dailyACK.bytes.write(to: dailyACK.url, options: .atomic)
+            await wakeMailboxAndWait(runtime, callback: try XCTUnwrap(fixture.mailboxObserver.onChange))
+            XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+            XCTAssertTrue(try fixture.pending().isEmpty)
+            XCTAssertNil(try fixture.stepCursor())
+            XCTAssertFalse(proof.hasUploadedRecords(lane: .steps, receiverBindingID: binding))
+        }
+    }
+
+    func testNativeMailboxUnknownRawACKCannotCoverNewObserverGeneration() async throws {
+        let fixture = try NativeMailboxAutomaticFixture(unseededEmptyRaw: true)
+        defer { fixture.cleanUp() }
+        var dailyReadCount = 0
+        let runtime = try makeNativeMailboxRuntime(fixture, readDailyActivityAggregates: { _, _, _, _ in
+            dailyReadCount += 1
+            return []
+        })
+        defer { runtime.automaticSyncRuntime.stopAdmission() }
+        await runtime.bootstrap()
+        for attempt in 1...2 {
+            let runID = UUID()
+            guard case .continueProcessing = runtime.viewModel.admitAutomaticSyncObserver(typeCode: "steps", diagnosticRunID: runID) else {
+                return XCTFail("Each new observation generation must be admitted.")
+            }
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .observer(typeCode: "steps"), diagnosticRunID: runID)
+            XCTAssertEqual(fixture.rawReadCount, attempt, "An older unknown-read ACK must not skip a newer generation's raw query.")
+            XCTAssertEqual(dailyReadCount, 0)
+            let raw = try XCTUnwrap(try fixture.outbox.pendingItems().first)
+            let acknowledgment = try fixture.signedAcknowledgment(for: raw)
+            try acknowledgment.bytes.write(to: acknowledgment.url, options: .atomic)
+            await wakeMailboxAndWait(runtime, callback: try XCTUnwrap(fixture.mailboxObserver.onChange))
+            XCTAssertFalse(try fixture.pending().isEmpty)
+            XCTAssertNil(try fixture.stepCursor())
+        }
+    }
+
     func testIdleMailboxRejectsInvalidReceiptsAndStaleEpochThenFinalizesProducerCursor() async throws {
         let fixture = try NativeMailboxAutomaticFixture()
         defer { fixture.cleanUp() }
@@ -791,7 +886,8 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         cancelInheritedLegacyUploads: @escaping @MainActor () async -> BackgroundUploadCancellationResult = {
             BackgroundUploadCancellationResult(cancelledCount: 0, fullyFinalized: true)
         },
-        backgroundRefreshScheduler: RecordingBackgroundRefreshScheduler = RecordingBackgroundRefreshScheduler()
+        backgroundRefreshScheduler: RecordingBackgroundRefreshScheduler = RecordingBackgroundRefreshScheduler(),
+        readDailyActivityAggregates: (@MainActor ([String], Date, Date, Calendar) async throws -> [HealthKitDailyActivityAggregate])? = nil
     ) throws -> HealthBridgeCompanionApplicationRuntime {
         let viewModel = try makeViewModel(
             root: fixture.root,
@@ -813,7 +909,10 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 try fixture.readSteps(anchor: anchor, start: start, receivedAt: receivedAt)
             },
             automaticSyncEligibleTypeCodesForTesting: ["steps"],
-            readDailyActivityAggregates: { _, _, _, _ in
+            readDailyActivityAggregates: { types, start, end, calendar in
+                if let readDailyActivityAggregates {
+                    return try await readDailyActivityAggregates(types, start, end, calendar)
+                }
                 XCTFail("Raw mailbox Steps must await receiver ACK before daily coverage.")
                 return []
             },
@@ -2107,7 +2206,15 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         try await exerciseNativeMailboxSleepStorageFailure(.pendingSave)
     }
 
-    private func exerciseNativeMailboxSleepStorageFailure(_ point: NativeSleepIOFaultStore.Point) async throws {
+    func testNativeAutomaticMailboxACKVerifiedSleepManifestSaveIOFailureIsStorage() async throws {
+        try await exerciseNativeMailboxSleepStorageFailure(.manifestSave, recoverWithoutACK: true)
+    }
+
+    func testNativeAutomaticMailboxACKVerifiedSleepPendingClearIOFailureIsStorage() async throws {
+        try await exerciseNativeMailboxSleepStorageFailure(.pendingClear, recoverWithoutACK: true)
+    }
+
+    private func exerciseNativeMailboxSleepStorageFailure(_ point: NativeSleepIOFaultStore.Point, recoverWithoutACK: Bool = false) async throws {
         let fixture = try NativeMailboxSleepFixture(queued: point != .pendingSave)
         defer { fixture.cleanUp() }
         var runtime = try await makeNativeMailboxSleepRuntime(fixture)
@@ -2137,6 +2244,36 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             XCTAssertEqual(item.deliveryState?.phase, .ackVerified)
         }
         XCTAssertEqual(fixture.recorder.invocationCount, 0)
+        if recoverWithoutACK {
+            let failures = fixture.store.failures.count
+            let authenticatedACKs = fixture.faults.authenticatedACKCount
+            let publishes = fixture.faults.publishCount
+            let acknowledgments = try XCTUnwrap(fixture.locator.lanes[.acks])
+            for acknowledgment in try FileManager.default.contentsOfDirectory(at: acknowledgments, includingPropertiesForKeys: nil)
+                where acknowledgment.pathExtension == "hba" {
+                try FileManager.default.removeItem(at: acknowledgment)
+            }
+            fixture.faults.automaticAcknowledgment = false
+            await runtime.automaticSyncRuntime.cancelAndWait()
+            do {
+                _ = try await fixture.delivery().deliverPending()
+                XCTFail("The real foreground recovery must reach the faulting Sleep store.")
+            } catch is SleepStorageOperationFailure {
+                // Durable ACK verification must retain local storage origin in both delivery entry points.
+            } catch {
+                XCTFail("ACK-verified foreground recovery lost the typed local-storage origin.")
+            }
+            runtime = try await makeNativeMailboxSleepRuntime(fixture, reloadStorage: true)
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .scheduledRefresh)
+            XCTAssertGreaterThan(fixture.store.failures.count, failures)
+            XCTAssertEqual(fixture.faults.authenticatedACKCount, authenticatedACKs, "Recovery must use durable ACK verification, not consume another ACK.")
+            XCTAssertEqual(fixture.faults.publishCount, publishes)
+            XCTAssertEqual(try fixture.outbox.pendingItems().first?.deliveryState?.phase, .ackVerified)
+            XCTAssertEqual(recordedSleepFailure(runtime.viewModel), .init(stage: .store, category: .operationFailed))
+            XCTAssertEqual(fixture.diagnostics.latestRecord?.failure, .init(stage: .store, category: .operationFailed))
+            XCTAssertFalse(fixture.diagnostics.latestRecord?.latestLaneSummary.contains(fixture.root.path) ?? true)
+            XCTAssertFalse(runtime.viewModel.statusMessage.contains(fixture.root.path))
+        }
         fixture.store.point = nil
         fixture.faults.storageFailureAfterAuthentication = nil
         // ACKed work resumes finalization; it must not publish another envelope.
@@ -3772,12 +3909,14 @@ private final class NativeMailboxAutomaticFixture {
     let nextAnchor: String
     let receiverAgreementKey: Curve25519.KeyAgreement.PrivateKey
     let receiverSigningKey: Curve25519.Signing.PrivateKey
+    let unseededEmptyRaw: Bool
     private(set) var connectionRecord: ReceiverConnectionRecordV2?
     private(set) var rawReadCount = 0
     var onRawRead: (() -> Void)?
     var stepsObserver: (HKObserverQuery, HealthKitBackgroundDeliveryCoordinator.ObserverUpdateHandler)?
 
-    init(inactiveDirectURL: String? = nil) throws {
+    init(inactiveDirectURL: String? = nil, unseededEmptyRaw: Bool = false) throws {
+        self.unseededEmptyRaw = unseededEmptyRaw
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("NativeMailboxAutomaticTests", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -3832,14 +3971,16 @@ private final class NativeMailboxAutomaticFixture {
                 forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
             )
         )
-        try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json")).saveCursorValue(
-            previousAnchor, receiverBindingID: identity.opaqueBinding,
-            sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
-            cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
-        )
-        CoreLaneUploadProofStore(userDefaults: defaults).markUploadedRecords(
-            lane: .steps, receiverBindingID: identity.opaqueBinding
-        )
+        if !unseededEmptyRaw {
+            try FileSyncCursorStore(fileURL: root.appendingPathComponent("cursors.json")).saveCursorValue(
+                previousAnchor, receiverBindingID: identity.opaqueBinding,
+                sourceKey: HealthBridgeAppleHealthSource.phone.sourceKey,
+                cursorKind: StepCountSyncBatchFactory.anchoredCursorKind
+            )
+            CoreLaneUploadProofStore(userDefaults: defaults).markUploadedRecords(
+                lane: .steps, receiverBindingID: identity.opaqueBinding
+            )
+        }
     }
 
     func makeSettingsStore() -> ReceiverSettingsStore {
@@ -3919,6 +4060,11 @@ private final class NativeMailboxAutomaticFixture {
     func readSteps(anchor: String?, start: Date?, receivedAt: Date) throws -> HealthKitAnchoredStepChanges {
         rawReadCount += 1
         onRawRead?()
+        if unseededEmptyRaw {
+            XCTAssertNil(anchor)
+            return HealthKitAnchoredStepChanges(stepSamples: [], deletedStepSamples: [], anchorCursorValue: nextAnchor,
+                windowStart: receivedAt, windowEnd: receivedAt)
+        }
         XCTAssertEqual(anchor, previousAnchor)
         XCTAssertNil(start)
         let sampleStart = receivedAt.addingTimeInterval(-120)

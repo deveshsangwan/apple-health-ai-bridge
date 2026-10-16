@@ -633,6 +633,8 @@ public final class ProductionMailboxDelivery {
             }
         } catch is CancellationError {
             throw CancellationError()
+        } catch let storage as SleepStorageOperationFailure {
+            throw storage
         } catch {
             throw ProductionMailboxDeliveryPhaseError.consumeAck
         }

@@ -652,6 +652,27 @@ def test_unresolved_deletion_changes_query_confidence_without_inferred_day(
     assert day(database).daily_activity_totals == {TYPE: 0}
 
 
+def test_unordered_unknown_deletion_invalidates_without_inventing_day(
+    database: Path,
+) -> None:
+    missing = "hk-quantity-flights-climbed-00000000-0000-0000-0000-000000000064"
+    counts = day(database).sample_counts
+    mutation = payload(None, deleted=[missing])
+    ingest(database, mutation)
+    result = day(database)
+    assert result.daily_activity_totals == {}
+    assert result.last_known_daily_activity_totals == {TYPE: 6}
+    assert result.daily_projection_status == {TYPE: "unknown"}
+    assert result.sample_counts == counts
+
+    ingest(
+        database, payload(3, samples=[sample(DAILY, 0, daily=True)], statistics=True)
+    )
+    assert day(database).daily_activity_totals == {TYPE: 0}
+    ingest(database, mutation)
+    assert day(database).daily_activity_totals == {TYPE: 0}
+
+
 def test_unresolved_marker_replay_cannot_replace_newer_confidence_boundary(
     database: Path,
 ) -> None:
@@ -681,8 +702,10 @@ def test_authoritative_statistics_can_establish_new_lineage_without_raw_values(
     assert day(database).daily_activity_totals == {TYPE: 0}
 
 
+@pytest.mark.parametrize("sequence", [None, 3])
 def test_unresolved_typed_uuid_does_not_change_another_type_confidence(
     database: Path,
+    sequence: int | None,
 ) -> None:
     steps = payload(1, baseline=True)
     encoded = OBSERVATION_PAYLOAD.validate_json(
@@ -704,7 +727,7 @@ def test_unresolved_typed_uuid_does_not_change_another_type_confidence(
     steps["sync"]["cursors"][0]["cursor_kind"] = "daily_projection_observation:steps"
     steps["sync"]["cursors"][0]["cursor_value"] = json.dumps(encoded)
     ingest(database, steps)
-    mutation = payload(3, deleted=[RAW + "-missing"])
+    mutation = payload(sequence, deleted=[RAW + "-missing"])
     encoded: dict[str, object] = {
         "namespace": NAMESPACE,
         "sequence": 3,
