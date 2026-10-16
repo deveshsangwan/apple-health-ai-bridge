@@ -4,6 +4,7 @@ from subprocess import CompletedProcess, run
 from typing import ClassVar, TypeVar
 
 import pytest
+from click import unstyle
 from pydantic import BaseModel, ConfigDict
 from typer.testing import CliRunner
 
@@ -93,7 +94,7 @@ def test_missing_or_invalid_config_never_creates_database_and_override_works(
     for command in (["status", "--json"], ["query", "synced-metrics"]):
         implicit = CliRunner().invoke(app, command)
         assert implicit.exit_code != 0
-        assert "--db" in implicit.output
+        assert "--db" in unstyle(implicit.output)
         explicit = CliRunner().invoke(app, [*command, "--db", str(db_path)])
         assert explicit.exit_code == 0
     assert set(home.rglob("*")) == before
