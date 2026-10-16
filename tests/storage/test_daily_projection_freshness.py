@@ -202,6 +202,69 @@ def database(tmp_path: Path) -> Path:
     return db
 
 
+@pytest.mark.parametrize("replayed_value", [6.0, 8.0], ids=["changed", "identical"])
+def test_unordered_raw_replay_preserves_order_and_fresh_daily_total(
+    database: Path, replayed_value: float
+) -> None:
+    ingest(
+        database,
+        payload(
+            10,
+            samples=[sample(RAW, 8)],
+            raw_intervals=[
+                {"client_record_id": RAW, "start_time": START, "end_time": END}
+            ],
+        ),
+    )
+    ingest(
+        database, payload(11, samples=[sample(DAILY, 8, daily=True)], statistics=True)
+    )
+    assert day(database).daily_activity_totals == {TYPE: 8}
+    with sqlite3.connect(database) as connection:
+        original = TypeAdapter(tuple[float, str]).validate_python(
+            connection.execute(
+                "select value,metadata_json from samples where client_record_id=?",
+                (RAW,),
+            ).fetchone()
+        )
+
+    for mutation in (
+        payload(None, samples=[sample(RAW, replayed_value)]),
+        payload(9, samples=[sample(RAW, 7)]),
+    ):
+        ingest(database, mutation)
+        with sqlite3.connect(database) as connection:
+            stored = TypeAdapter(tuple[float, str]).validate_python(
+                connection.execute(
+                    "select value,metadata_json from samples where client_record_id=?",
+                    (RAW,),
+                ).fetchone()
+            )
+        assert stored == original
+        result = day(database)
+        assert result.daily_activity_totals == {TYPE: 8}
+        assert result.daily_projection_status == {TYPE: "fresh"}
+
+
+def test_unordered_raw_without_prior_order_still_accepts_updates(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "unordered-raw.sqlite"
+    for value in (6.0, 8.0):
+        ingest(db, payload(None, samples=[sample(RAW, value)]))
+        with sqlite3.connect(db) as connection:
+            stored = TypeAdapter(tuple[float, str]).validate_python(
+                connection.execute(
+                    "select value,metadata_json from samples where client_record_id=?",
+                    (RAW,),
+                ).fetchone()
+            )
+        assert stored[0] == value
+        assert "_bridge_raw_observation" not in OBSERVATION_PAYLOAD.validate_json(
+            stored[1]
+        )
+
+
 def test_raw_deletion_unknown_retains_value_but_excludes_current_total(
     database: Path,
 ) -> None:

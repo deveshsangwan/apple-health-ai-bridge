@@ -389,8 +389,14 @@ class DailyProjectionIngest:
         }
 
     def _accept_order(
-        self, source: int, type_code: str, observation: Observation, previous: object
+        self,
+        source: int,
+        type_code: str,
+        observation: Observation | None,
+        previous: object,
     ) -> bool:
+        if observation is None:
+            return not _map(previous)
         if _newer(observation, previous):
             return True
         prior_namespace = _map(previous).get("namespace")
@@ -421,12 +427,8 @@ class DailyProjectionIngest:
                 continue
             old = self.old.get((source, identifier))
             observation = self.by_source_type.get((source, type_code))
-            if (
-                old
-                and observation
-                and not self._accept_order(
-                    source, type_code, observation, old[4].get(RAW_ORDER_KEY)
-                )
+            if old and not self._accept_order(
+                source, type_code, observation, old[4].get(RAW_ORDER_KEY)
             ):
                 continue
             if old and (old[1], old[2], old[3]) == (
@@ -650,12 +652,8 @@ class DailyProjectionIngest:
             if key not in {STATE_KEY, RAW_ORDER_KEY}
         }
         if metadata.get("sample_kind") == "raw_quantity":
-            if (
-                old
-                and observation
-                and not self._accept_order(
-                    source, type_code, observation, old[4].get(RAW_ORDER_KEY)
-                )
+            if old and not self._accept_order(
+                source, type_code, observation, old[4].get(RAW_ORDER_KEY)
             ):
                 return None
             if observation:
