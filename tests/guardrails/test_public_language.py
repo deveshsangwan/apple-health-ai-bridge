@@ -1,5 +1,7 @@
+import json
 import re
 import tomllib
+from html import unescape
 from pathlib import Path
 from typing import cast
 
@@ -210,31 +212,88 @@ def test_readme_uses_one_project_name_without_a_relationship_explainer() -> None
     assert "https://github.com/roian6/apple-health-ai-bridge.git@" in readme
 
 
-def test_readme_does_not_repeat_its_opening_as_a_prompt_list() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-    introduction = readme.split("---", maxsplit=1)[1].split(
-        "## Set up the bridge",
-        maxsplit=1,
-    )[0]
+def test_readme_uses_official_app_store_install_artwork() -> None:
+    header = (
+        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    )
+    target = "https://apps.apple.com/us/app/health-bridge-for-ai/id6786152806"
+    match = re.search(
+        rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
+        header,
+    )
 
-    assert "Try asking:" not in introduction
-    assert "Example prompts:" not in readme
-    assert not any(line.startswith("- ") for line in introduction.splitlines())
+    assert match is not None
+    image = match.group(1)
+    official_artwork = "https://developer.apple.com/assets/elements/badges/"
+    official_artwork += "download-on-the-app-store.svg"
+    assert f'src="{official_artwork}"' in image
+    assert 'alt="Download on the App Store"' in image
+    assert 'height="40"' in image
+
+
+def test_readme_links_status_badges_to_their_public_sources() -> None:
+    header = (
+        Path("README.md").read_text(encoding="utf-8").split("</div>", maxsplit=1)[0]
+    )
+    repository = "roian6/apple-health-ai-bridge"
+    expected_links = (
+        (
+            f"https://github.com/{repository}/releases",
+            f"https://img.shields.io/github/v/release/{repository}?filter=receiver-v%2A",
+        ),
+        (
+            f"https://github.com/{repository}/actions/workflows/python.yml",
+            f"https://img.shields.io/github/actions/workflow/status/{repository}/python.yml?branch=main",
+        ),
+        (
+            f"https://github.com/{repository}/actions/workflows/ios.yml",
+            f"https://img.shields.io/github/actions/workflow/status/{repository}/ios.yml?branch=main",
+        ),
+        ("LICENSE", f"https://img.shields.io/github/license/{repository}?"),
+    )
+    for target, endpoint in expected_links:
+        match = re.search(
+            rf'<a href="{re.escape(target)}">\s*(<img\b[^>]*>)\s*</a>',
+            header,
+        )
+        assert match is not None, target
+        image = unescape(match.group(1))
+        assert endpoint in image
+        assert "style=flat-square" in image
+        assert 'height="20"' in image
+
+
+def test_readme_introduces_user_workflows_before_installation_details() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    introduction, setup = readme.split("## Get started", maxsplit=1)
+
+    assert any(line.startswith("> ") for line in introduction.splitlines())
+    assert "```bash" not in introduction
+    assert "health-bridge setup" not in introduction
+    assert "uv tool install" in setup
+    assert "docs/setup.md#connect-an-mcp-client-intentionally" in setup
 
 
 def test_readme_keeps_continuous_value_with_ios_timing_boundary() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     architecture = Path("docs/architecture.md").read_text(encoding="utf-8")
+    setup = Path("docs/setup.md").read_text(encoding="utf-8")
 
-    introduction = readme.split("## Set up the bridge", maxsplit=1)[0]
+    introduction = readme.split("## Get started", maxsplit=1)[0]
     assert "Automatic sync" in introduction
-    assert "without exporting another file" in introduction
-    assert (
-        "iOS controls background scheduling, so delivery timing is best-effort "
-        "rather than real-time or guaranteed at a specific moment."
-    ) in readme
+    assert "iOS controls background scheduling" in setup
     assert "iOS controls whether and when background execution occurs" in architecture
     assert "guaranteed to be immediate" in architecture
+
+
+def test_readme_explains_storage_and_cloud_ai_in_one_privacy_section() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    privacy = readme.split("## Privacy", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+
+    assert "read-only" in privacy.lower()
+    assert "cloud" in privacy.lower()
+    assert "provider" in privacy.lower()
+    assert "SECURITY.md" in privacy
 
 
 def test_package_metadata_connects_distribution_to_public_surfaces() -> None:
@@ -281,12 +340,12 @@ def test_readme_makes_app_store_primary_without_exposing_maintainer_operations()
     assert "Install the iPhone beta" not in primary_navigation
     assert "official TestFlight install page" not in readme
     assert "Download [the iPhone app from the App Store]" in readme
-    assert "TestFlight remains available for beta builds" in readme
+    assert "TestFlight" in setup_guide
     assert "docs/maintainers/" not in readme
     assert "App Review" not in docs_section
     assert "Public source preview" not in readme
     assert "may lag behind the latest GitHub release" not in readme
-    assert "native Windows is not currently supported" in readme
+    assert "macOS or Linux computer" in readme
     assert "native Windows is not currently supported" in setup_guide
     assert "Numeric LAN IPs are supported" in setup_guide
     assert "scutil --get LocalHostName" in setup_guide
@@ -327,7 +386,6 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     )
     assert "--receiver-host 0.0.0.0" in setup_guide
     assert "--receiver-port 8765" in setup_guide
-    assert "--receiver-host 0.0.0.0" in Path("README.md").read_text(encoding="utf-8")
 
     for route_handoff in (
         Path("docs/agent-assisted-setup.md"),
@@ -388,30 +446,39 @@ def test_primary_onboarding_requires_a_real_remote_receiver_route() -> None:
     assert "agent-managed private HTTPS ingress" not in route_language
     assert "agent-managed service plan" not in route_language
 
-    for copy, ordered_steps in (
-        (
-            readme,
-            (
-                "Prepare the receiver route",
-                "Install and run setup",
-                "approved service manager",
-                "printed local `/health` URL",
-                "phone-facing `/health` URL",
-                "Pair and sync",
-            ),
-        ),
-        (
-            setup_guide,
-            (
-                "Choose one of the following routes",
-                "Install and run core setup",
-                "Start and verify the receiver",
-                "Pair the iPhone",
-            ),
-        ),
-    ):
-        positions = [copy.index(step) for step in ordered_steps]
-        assert positions == sorted(positions)
+    assert "(docs/setup.md)" in readme
+    assert "private HTTPS route" in readme
+    ordered_steps = (
+        "Choose one of the following routes",
+        "Install and run core setup",
+        "Start and verify the receiver",
+        "Pair the iPhone",
+    )
+    positions = [setup_guide.index(step) for step in ordered_steps]
+    assert positions == sorted(positions)
+
+
+def test_setup_connects_an_existing_store_before_the_first_ai_question() -> None:
+    setup = Path("docs/setup.md").read_text(encoding="utf-8")
+    client_setup, first_question = setup.split("## Ask your first question", maxsplit=1)
+    client_setup = client_setup.split(
+        "## Connect an MCP client intentionally", maxsplit=1
+    )[1]
+    entries: list[str] = re.findall(r"```json\n(.*?)\n```", client_setup, re.DOTALL)
+
+    assert len(entries) == 1
+    descriptor = cast("dict[str, object]", json.loads(entries[0]))
+    assert str(descriptor["command"]).endswith("health-bridge")
+    assert descriptor["args"] == [
+        "mcp",
+        "start",
+        "--db",
+        "/absolute/path/to/health.sqlite",
+    ]
+    assert "command -v health-bridge" in client_setup
+    assert "already paired" in client_setup
+    assert "get_bridge_status" in first_question
+    assert "list_synced_metrics" in first_question
 
 
 def test_contributor_and_release_docs_match_ci_release_gates() -> None:
@@ -470,11 +537,12 @@ def test_public_docs_explain_safe_local_purge_without_claiming_health_deletion()
     readme = Path("README.md").read_text()
     setup = Path("docs/setup.md").read_text()
 
-    for text in (readme, setup):
-        assert "health-bridge receiver purge" in text
-        assert "--confirm" in text
-        assert "dry-run" in text
-        assert "does not delete Apple Health data" in text
+    assert "(docs/setup.md#remove-local-bridge-data)" in readme
+    assert "health-bridge receiver purge" not in readme
+    assert "health-bridge receiver purge" in setup
+    assert "--confirm" in setup
+    assert "dry-run" in setup
+    assert "does not delete Apple Health data" in setup
 
 
 def test_public_docs_do_not_publish_an_unavailable_beta_surface() -> None:
