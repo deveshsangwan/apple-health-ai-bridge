@@ -8,6 +8,83 @@ import XCTest
 
 @MainActor
 final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
+    func testIssue96AutomaticSleepPreparationKeepsMainActorResponsive() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let runtime = try await makeIssue96Runtime(fixture, barrier: barrier)
+        barrier.startDriver()
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        try await barrier.joinDriver()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        let observation = barrier.observation()
+        XCTAssertTrue(observation.entered, "Automatic sync must reach the real sleep preparation boundary.")
+        XCTAssertTrue(observation.actionBeforeRelease, "MainActor must run while sleep preparation is blocked.")
+        XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest,
+            "Preparing and acknowledging a payload must not bypass sleep transition finalization.")
+        let pending = try XCTUnwrap(fixture.sleep.loadPendingTransition())
+        XCTAssertEqual(pending.manifest.anchorCursorValue, fixture.nextAnchor)
+        XCTAssertEqual(pending.manifest.publishedSessions, fixture.initialManifest.publishedSessions)
+        XCTAssertEqual(pending.manifest.nextRevisionSequence, fixture.initialManifest.nextRevisionSequence)
+        let batch = try JSONDecoder().decode(HealthBridgeBatchV1.self, from: pending.payload)
+        XCTAssertTrue(batch.sleepSessions.isEmpty, "An unchanged history must not republish sleep records.")
+        XCTAssertTrue(batch.deletedRecords.isEmpty)
+        XCTAssertEqual(batch.sync.cursors.map(\.cursorValue), [fixture.nextAnchor])
+        XCTAssertEqual(fixture.recorder.acceptedPayloads, [pending.payload])
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+    }
+
+    func testIssue96CancellationDuringSleepPreparationCannotJournalOrAdvanceAnchor() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let runtime = try await makeIssue96Runtime(fixture, barrier: barrier)
+        let operation = Task { @MainActor in
+            await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        }
+        barrier.startDriver { operation.cancel() }
+
+        await operation.value
+        try await barrier.joinDriver()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        let observation = barrier.observation()
+        XCTAssertTrue(observation.entered)
+        XCTAssertTrue(observation.actionBeforeRelease, "Cancellation must occur while preparation is blocked.")
+        try assertIssue96PreparationWasAbandoned(fixture, runtime: runtime)
+    }
+
+    func testIssue96ConnectionChangeDuringSleepPreparationCannotJournalOrAdvanceAnchor() async throws {
+        let fixture = try DirectSleepPreparationFixture()
+        defer { fixture.cleanUp() }
+        let barrier = DirectSleepPreparationBarrier()
+        defer { barrier.releasePreparation() }
+        let runtime = try await makeIssue96Runtime(fixture, barrier: barrier)
+        let previousGeneration = fixture.settings.receiverSettingsGenerationToken
+        barrier.startDriver {
+            try fixture.settings.save(
+                receiverURLString: "http://127.0.0.1:8766/v1/batches",
+                bearerToken: "synthetic-issue96-replacement-credential",
+                rotateBindingID: true
+            )
+        }
+
+        await runtime.automaticSyncRuntime.runAutomaticSync(reason: .launchCatchUp)
+        try await barrier.joinDriver()
+        await runtime.automaticSyncRuntime.cancelAndWait()
+
+        let observation = barrier.observation()
+        XCTAssertTrue(observation.entered)
+        XCTAssertTrue(observation.actionBeforeRelease, "Connection replacement must happen before preparation completes.")
+        XCTAssertNotEqual(fixture.settings.receiverSettingsGenerationToken, previousGeneration)
+        try assertIssue96PreparationWasAbandoned(fixture, runtime: runtime)
+    }
+
     func testIssue63PopulatedDailyControlsDeliverSixAndZero() async throws {
         for value in [6.0, 0.0] {
             let fixture = try AutomaticStepsFaultFixture()
@@ -2547,6 +2624,71 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel)
     }
 
+    private func makeIssue96Runtime(
+        _ fixture: DirectSleepPreparationFixture,
+        barrier: DirectSleepPreparationBarrier
+    ) async throws -> HealthBridgeCompanionApplicationRuntime {
+        #if !HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST
+        throw XCTSkip("Requires HEALTH_BRIDGE_ISOLATED_APP_TEST_HOST for synthetic app testing.")
+        #else
+        PayloadFenceURLProtocol.networkRecorder = fixture.recorder
+        let viewModel = try makeViewModel(
+            root: fixture.root, defaults: fixture.defaults, settingsStore: fixture.settings,
+            pairingStateStore: ReceiverPairingStateStore(
+                pendingStore: MemoryReceiverTokenStore(), installationIDStore: MemoryReceiverTokenStore(),
+                cancellationStore: MemoryReceiverTokenStore(),
+                installationIDGenerator: { DirectSleepPreparationFixture.installationID }
+            ),
+            outbox: fixture.outbox, receiverClient: ReceiverClient(session: fixture.session),
+            automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore(fileURL: fixture.root.appendingPathComponent("diagnostics.json")),
+            sleepManifestStore: fixture.sleep,
+            sleepSyncPreparer: AnchoredSleepSyncPreparer(beforePreparation: { barrier.blockPreparation() }),
+            readAnchoredSleepChanges: { anchor, start, receivedAt in
+                fixture.readAnchors.append(anchor)
+                XCTAssertEqual(anchor, fixture.previousAnchor)
+                XCTAssertNil(start)
+                return HealthKitAnchoredSleepChanges(
+                    addedSamples: [], deletedSamples: [],
+                    anchorCursorValue: fixture.nextAnchor, receivedAt: receivedAt
+                )
+            },
+            automaticSyncEligibleTypeCodesForTesting: ["sleep_analysis"],
+            scheduleDirectBackgroundUploads: { 0 },
+            terminalBackgroundPayloadDrain: { true },
+            platformBackgroundPayloadDrain: { true }
+        )
+        await viewModel.bootstrap()
+        XCTAssertTrue(viewModel.canSyncSleep, viewModel.statusMessage)
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        let coordinator = HealthKitBackgroundDeliveryCoordinator(
+            healthDataAvailable: { false },
+            executeQuery: { _ in XCTFail("Issue96 tests must use only the injected synthetic sleep reader.") },
+            stopQuery: { _ in }, enableDelivery: { _, completion in completion(false, nil) },
+            disableDelivery: { _ in }
+        )
+        let platform = AutomaticSyncRuntime.Platform(
+            scheduleRefresh: { _ in }, cancelRefresh: {}, consumeRefresh: {},
+            setUploadAdmission: { _ in }, beginBackgroundOwner: { _ in {} },
+            healthDataAvailable: { false }, backgroundDeliveryCoordinator: coordinator
+        )
+        return HealthBridgeCompanionApplicationRuntime(viewModel: viewModel, automaticSyncPlatform: platform)
+        #endif
+    }
+
+    private func assertIssue96PreparationWasAbandoned(
+        _ fixture: DirectSleepPreparationFixture,
+        runtime: HealthBridgeCompanionApplicationRuntime
+    ) throws {
+        XCTAssertEqual(fixture.readAnchors, [fixture.previousAnchor])
+        XCTAssertEqual(try fixture.sleep.loadManifest(), fixture.initialManifest)
+        XCTAssertNil(try fixture.sleep.loadPendingTransition())
+        XCTAssertTrue(try fixture.outbox.pendingItems().isEmpty)
+        XCTAssertEqual(try fixture.background.loadPendingObserverTypeCodeGenerations(), fixture.generations)
+        XCTAssertTrue(fixture.recorder.payloads.isEmpty, "Abandoned preparation must not reach the transport.")
+        XCTAssertFalse(runtime.viewModel.activityLogMessages.contains { $0.contains("Uploading ") },
+            "Abandoned preparation must not publish an upload-start status.")
+    }
+
     private func makeViewModel(
         root: URL,
         defaults: UserDefaults,
@@ -2556,6 +2698,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
         receiverClient: ReceiverClient = ReceiverClient(),
         automaticSyncDiagnosticStore: AutomaticSyncDiagnosticStore = AutomaticSyncDiagnosticStore(),
         sleepManifestStore: (any SleepSyncManifestStoring)? = nil,
+        sleepSyncPreparer: AnchoredSleepSyncPreparer = AnchoredSleepSyncPreparer(),
         readAnchoredSleepChanges: (@MainActor (
             String?, Date?, Date
         ) async throws -> HealthKitAnchoredSleepChanges)? = nil,
@@ -2604,6 +2747,7 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
                 tokenStore: MemoryReceiverTokenStore(),
                 epochFloorProvider: { 1 }
             ),
+            sleepSyncPreparer: sleepSyncPreparer,
             mailboxKeyStore: MailboxKeyStore(
                 service: "synthetic.reset-regression",
                 keychain: MemoryMailboxKeychain()
@@ -2619,6 +2763,151 @@ final class HealthBridgeCompanionResetAdmissionTests: XCTestCase {
             platformBackgroundPayloadDrain: platformBackgroundPayloadDrain,
             readAnchoredQuantityChanges: readAnchoredQuantityChanges
         )
+    }
+}
+
+@MainActor
+private final class DirectSleepPreparationFixture {
+    static let installationID = "synthetic-issue96-installation"
+    let root: URL
+    let suiteName = "Synthetic.Issue96.SleepPreparation.\(UUID())"
+    let defaults: UserDefaults
+    let settings: ReceiverSettingsStore
+    let background: BackgroundSyncSettingsStore
+    let generations: [String: Int]
+    let sleep: FileSleepSyncManifestStore
+    let outbox: FileOutbox
+    let initialManifest: SleepSyncManifest
+    let previousAnchor = "synthetic-issue96-previous-anchor"
+    let nextAnchor = "synthetic-issue96-next-anchor"
+    let recorder = PayloadFenceNetworkRecorder()
+    let session: URLSession
+    var readAnchors: [String?] = []
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("Synthetic-Issue96-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        settings = ReceiverSettingsStore(
+            userDefaults: defaults, tokenStore: MemoryReceiverTokenStore(),
+            preCutoverBackupStore: MemoryReceiverTokenStore(), synchronize: { true }
+        )
+        try settings.save(receiverURLString: "http://127.0.0.1:8765/v1/batches",
+            bearerToken: "synthetic-issue96-credential", rotateBindingID: true)
+        background = BackgroundSyncSettingsStore(userDefaults: defaults)
+        try background.setEnabledDurably(true)
+        try background.markPendingObserverTypeCodes(["sleep_analysis"])
+        generations = try background.loadPendingObserverTypeCodeGenerations()
+        CompanionHealthPermissionRequestStore(userDefaults: defaults).recordCompletedRequest(
+            runtimeTypeCodes: HealthKitReadTypeCatalog.availableTypeCodes(
+                forTypeCodes: HealthBridgeBackgroundSync.supportedUnifiedReadTypeCodes
+            )
+        )
+        outbox = try FileOutbox(directory: root.appendingPathComponent("outbox"))
+        sleep = try FileSleepSyncManifestStore(fileURL: root.appendingPathComponent("sleep.json"))
+        let reservation = SleepSyncBatchFactory.makeManifestReservation(
+            receiverSettingsGeneration: settings.receiverSettingsGenerationToken,
+            historyDepth: .allAvailable, historyStartDate: nil,
+            sourceKey: "apple_health.phone.\(Self.installationID)", baselineResetEpoch: 1,
+            identityNamespace: try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000096"))
+        )
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let samples = try (0 ..< 24).map { index in
+            let start = date.addingTimeInterval(Double(index / 8) * 86_400 + Double(index % 8) * 1_800)
+            return HealthKitSleepChildSample(
+                uuid: try XCTUnwrap(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index))),
+                stage: index.isMultiple(of: 2) ? "core" : "deep", start: start,
+                end: start.addingTimeInterval(1_800)
+            )
+        }
+        initialManifest = try XCTUnwrap(SleepSyncBatchFactory.makeAnchoredSleepTransition(
+            previousManifest: reservation,
+            changes: HealthKitAnchoredSleepChanges(addedSamples: samples, deletedSamples: [],
+                anchorCursorValue: previousAnchor, receivedAt: date.addingTimeInterval(259_200)),
+            receiverSettingsGeneration: settings.receiverSettingsGenerationToken,
+            historyDepth: .allAvailable, historyStartDate: nil, generatedAt: date
+        )).manifest
+        try sleep.saveManifest(initialManifest)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PayloadFenceURLProtocol.self]
+        session = URLSession(configuration: configuration)
+    }
+
+    func cleanUp() {
+        session.invalidateAndCancel()
+        PayloadFenceURLProtocol.networkRecorder = nil
+        defaults.removePersistentDomain(forName: suiteName)
+        XCTAssertNoThrow(try FileManager.default.removeItem(at: root))
+    }
+}
+
+// The independent driver can release preparation even if a regression blocks MainActor.
+// Every mutable field is protected by the lock; the optional action is joined on MainActor.
+private final class DirectSleepPreparationBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private let actionDone = DispatchSemaphore(value: 0)
+    private let driver = DispatchGroup()
+    private var didEnter = false
+    private var observedEntry = false
+    private var released = false
+    private var actionBeforeRelease = false
+    private var actionTask: Task<Void, any Error>?
+
+    func blockPreparation() {
+        let isFirst = lock.withLock {
+            guard !didEnter else { return false }
+            didEnter = true
+            return true
+        }
+        guard isFirst else { return }
+
+        entered.signal()
+        if release.wait(timeout: .now() + 15) != .success {
+            releasePreparation()
+        }
+    }
+
+    func startDriver(action: @escaping @MainActor @Sendable () throws -> Void = {}) {
+        driver.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { driver.leave() }
+            let observed = entered.wait(timeout: .now() + 5) == .success
+            lock.withLock { observedEntry = observed }
+            if observed {
+                let task = Task { @MainActor [self] in
+                    defer { actionDone.signal() }
+                    try action()
+                    lock.withLock { actionBeforeRelease = !released }
+                }
+                lock.withLock { actionTask = task }
+                _ = actionDone.wait(timeout: .now() + 5)
+            }
+            releasePreparation()
+        }
+    }
+
+    func releasePreparation() {
+        let shouldRelease = lock.withLock {
+            guard !released else { return false }
+            released = true
+            return true
+        }
+        if shouldRelease { release.signal() }
+    }
+
+    func joinDriver() async throws {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            driver.notify(queue: .global()) { continuation.resume() }
+        }
+        let task = lock.withLock { actionTask }
+        try await task?.value
+    }
+
+    func observation() -> (entered: Bool, actionBeforeRelease: Bool) {
+        lock.withLock { (observedEntry, actionBeforeRelease) }
     }
 }
 

@@ -378,6 +378,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
     private var sleepManifestStore: SleepSyncManifestStoring?
     private let sleepManifestFileURL: URL?
     private let sleepResetEpochStore: SleepResetEpochStore
+    private let sleepSyncPreparer: AnchoredSleepSyncPreparer
     private let readAnchoredSleepChanges: (@MainActor (
         String?, Date?, Date
     ) async throws -> HealthKitAnchoredSleepChanges)?
@@ -429,6 +430,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         sleepManifestStore: SleepSyncManifestStoring? = HealthBridgeCompanionViewModel.makeDefaultSleepManifestStore(),
         sleepManifestFileURL: URL? = HealthBridgeCompanionViewModel.defaultSleepManifestFileURL(),
         sleepResetEpochStore: SleepResetEpochStore = SleepResetEpochStore(),
+        sleepSyncPreparer: AnchoredSleepSyncPreparer = AnchoredSleepSyncPreparer(),
         mailboxKeyStore: MailboxKeyStore = MailboxKeyStore(
             service: HealthBridgeAppIdentity.mailboxKeychainServiceName
         ),
@@ -515,6 +517,7 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
         self.sleepManifestStore = sleepManifestStore
         self.sleepManifestFileURL = sleepManifestFileURL
         self.sleepResetEpochStore = sleepResetEpochStore
+        self.sleepSyncPreparer = sleepSyncPreparer
         self.readAnchoredSleepChanges = readAnchoredSleepChanges
         self.readAnchoredStepChanges = readAnchoredStepChanges
         self.automaticSyncEligibleTypeCodesForTesting = automaticSyncEligibleTypeCodesForTesting
@@ -5079,19 +5082,27 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                   settingsStore.receiverURLString == url.absoluteString else {
                 throw CancellationError()
             }
-            guard let transition = SleepSyncBatchFactory.makeAnchoredSleepTransition(
-                previousManifest: manifestPlan.previousManifest,
+            failureStage = .encoding
+            let preparation = try await sleepSyncPreparer.prepare(
+                plan: manifestPlan,
                 changes: changes,
                 receiverSettingsGeneration: currentReceiverGeneration,
                 historyDepth: currentHistoryDepth,
-                historyStartDate: manifestPlan.historyStartDate,
-                forceRepublishAll: manifestPlan.forceRepublishAll,
                 generatedAt: now
-            ) else {
+            )
+            try Task.checkCancellation()
+            try requireCurrentConnectionGeneration(currentReceiverGeneration)
+            guard settingsStore.receiverBindingID == currentReceiverBindingID,
+                  settingsStore.receiverURLString == url.absoluteString else {
+                throw CancellationError()
+            }
+
+            guard let preparation else {
                 statusIsError = false
                 statusMessage = "HealthKit returned no readable Sleep records. No deletion was inferred and no sleep anchor was advanced."
                 return false
             }
+            let transition = preparation.transition
             let batch = transition.batch
             let uploadedRecords = !batch.sleepSessions.isEmpty
             let hasRecordChanges = uploadedRecords || !batch.deletedRecords.isEmpty
@@ -5099,16 +5110,8 @@ final class HealthBridgeCompanionViewModel: ObservableObject {
                 ? "\(batch.sleepSessions.count) sleep revision(s), \(batch.deletedRecords.count) sleep deletion(s)"
                 : "sleep anchor cursor-only sync"
             statusMessage = "Uploading \(uploadDescription) to \(url.host() ?? url.absoluteString)..."
-            failureStage = .encoding
-            let data = try encoder.encode(batch)
-            try Task.checkCancellation()
-            try requireCurrentConnectionGeneration(currentReceiverGeneration)
-            guard settingsStore.receiverBindingID == currentReceiverBindingID,
-                  settingsStore.receiverURLString == url.absoluteString else {
-                throw CancellationError()
-            }
             let pendingTransition = SleepSyncPendingTransition(
-                payload: data,
+                payload: preparation.payload,
                 manifest: transition.manifest,
                 receiverBindingID: currentReceiverBindingID,
                 connectionGeneration: currentReceiverGeneration

@@ -176,7 +176,18 @@ def test_anchored_sleep_uses_receiver_bound_manifest_after_durable_delivery() ->
     assert "historyDepth: currentHistoryDepth" in body
     assert "anchorCursorValue: manifestPlan.anchorCursorValue" in body
     assert "historyStartDate: manifestPlan.historyStartDate" in body
-    assert "forceRepublishAll: manifestPlan.forceRepublishAll" in body
+    assert "plan: manifestPlan" in body
+    factory = (
+        ROOT
+        / "ios/HealthBridgeCompanion/Sources/HealthBridgeCompanionCore"
+        / "StepCountSyncBatchFactory.swift"
+    ).read_text()
+    preparer = factory[
+        factory.index("public struct AnchoredSleepSyncPreparer") : factory.index(
+            "public enum SleepSyncBatchFactory"
+        )
+    ]
+    assert "forceRepublishAll: plan.forceRepublishAll" in preparer
     reservation = body.index("sleepManifestStore.saveManifest(reservation)")
     journal = body.index("sleepManifestStore.savePendingTransition(pendingTransition)")
     delivery = body.index("deliverPendingSleepTransition(", journal)
