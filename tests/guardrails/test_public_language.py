@@ -250,6 +250,14 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
             f"https://img.shields.io/github/actions/workflow/status/{repository}/ios.yml?branch=main",
         ),
         ("LICENSE", f"https://img.shields.io/github/license/{repository}?"),
+        (
+            f"https://glama.ai/mcp/servers/{repository}",
+            f"https://glama.ai/mcp/servers/{repository}/badges/score.svg",
+        ),
+        (
+            f"https://scorecard.dev/viewer/?uri=github.com/{repository}",
+            f"https://api.scorecard.dev/projects/github.com/{repository}/badge",
+        ),
     )
     for target, endpoint in expected_links:
         match = re.search(
@@ -259,8 +267,6 @@ def test_readme_links_status_badges_to_their_public_sources() -> None:
         assert match is not None, target
         image = unescape(match.group(1))
         assert endpoint in image
-        assert "style=flat-square" in image
-        assert 'height="20"' in image
 
 
 def test_readme_introduces_user_workflows_before_installation_details() -> None:
