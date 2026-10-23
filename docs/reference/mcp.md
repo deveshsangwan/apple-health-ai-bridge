@@ -77,6 +77,28 @@ An initialized empty database has zero counts, null `latest_sync`, empty `metric
 and cursor arrays, and notes about absent sync/token configuration. The synthetic
 fixture has three samples, one workout, and one sleep session.
 
+For each metric, `cursor_count` counts distinct ingestion sources with a recognized
+sample-sync checkpoint. A source contributes once even when it retains legacy
+foreground, shared anchored, and independent automatic anchored cursors.
+`latest_cursor_updated_at` is the newest receiver storage timestamp across those
+checkpoints. Dedicated steps, sleep and workout anchors and generic quantity
+anchors contribute, including the automatic quantity fallback. Legacy foreground
+checkpoints and the `body_mass`/`weight` and `active_energy`/`energy` aliases remain
+supported. Stored cursor ownership and values are unchanged by this reporting.
+
+Unknown cursors, bootstrap/reset markers and daily aggregate checkpoints remain
+visible in `sync_cursors` without contributing to metric checkpoint counts or
+timestamps. In particular, the shared activity aggregate checkpoint does not
+identify which metric subset was processed. Per-type daily projection observation
+markers are consumed during ingestion and are not stored in `sync_cursors`.
+
+Cursor recency is not sample recency, daily projection freshness, or proof of
+complete history. Automatic fallback reads can cover only a recent window.
+Quantity `record_count` and record time bounds include both raw samples and daily
+projections; they do not describe raw-only coverage. A recent raw checkpoint can
+coexist with a `last_known` or `unknown` daily projection. Use the daily query's
+projection state and completed-day totals to assess that projection separately.
+
 ### `get_bridge_context_markdown`
 
 Input: no arguments. Returns Markdown text beginning `# Health Bridge Context`,
